@@ -26,6 +26,11 @@ class EnvDefault(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+def port_range(text):
+    start, stop = text.split(":", 1)
+    return range(int(start), int(stop))
+
+
 def main(*args):
     """Run a Tango gateway server from CLI arguments."""
     # Create parser
@@ -44,6 +49,11 @@ def main(*args):
         '--tango', '-t', metavar='HOST',
         action=EnvDefault, envvar='TANGO_GATEWAY_HOST',
         help='Tango host (default is given by PyTango)')
+    parser.add_argument(
+        '--port-range', '-r', metavar='PORT_RANGE',
+        action=EnvDefault, envvar='TANGO_GATEWAY_PORT_RANGE',
+        type=port_range,
+        help='Open CORBA anf ZMQ ports on specified range')
     parser.add_argument('--verbose', '-v', action='store_true')
     # Parse arguments
     namespace = parser.parse_args(*args)
@@ -67,6 +77,7 @@ def main(*args):
     return run_gateway_server(namespace.bind,
                               namespace.port,
                               namespace.tango,
+                              namespace.port_range,
                               namespace.verbose)
 
 

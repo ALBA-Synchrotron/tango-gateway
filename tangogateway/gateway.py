@@ -68,6 +68,12 @@ def make_translater(sub, pub):
     return lambda value, reverse=False: value.replace(*args[reverse])
 
 
+def get_free_port(bag):
+    if bag is None:
+        return 0
+    return bag.pop()
+
+
 # Coroutine helpers
 
 @asyncio.coroutine
@@ -118,7 +124,7 @@ def get_forwarding(host, port, handler_type,
     # Check cache
     key = host, port, bind_address
     if key in loop.forward_dict:
-        return (yield from loop.forward_dict[key])
+        return (yield from loop.forward_dict[key][0])
     # No connection check for DB
     if handler_type == HandlerType.DB:
         loop.db_key = key
@@ -126,11 +132,16 @@ def get_forwarding(host, port, handler_type,
     elif not (yield from get_connection(key, loop, only_check=True)):
         return None, bind_address, loop.bound_port
     # Start forwarding
-    loop.forward_dict[key] = asyncio.Future(loop=loop)
+    if server_port == 0:
+        try:
+            server_port = get_free_port(loop.free_ports)
+        except KeyError:
+            raise ConnectionRefusedError('No more free ports available')
+    loop.forward_dict[key] = asyncio.Future(loop=loop), server_port
     value = yield from start_forwarding(
         host, port, handler_type, bind_address, server_port, loop)
     # Set cache
-    loop.forward_dict[key].set_result(value)
+    loop.forward_dict[key][0].set_result(value)
     return value
 
 
@@ -171,11 +182,15 @@ def start_forwarding(host, port, handler_type,
 @asyncio.coroutine
 def stop_forwarding(key, loop):
     # Get server
-    if key not in loop.forward_dict or \
-       not loop.forward_dict[key].done() or \
-       loop.forward_dict[key].exception():
+    forward = loop.forward_dict.pop(key, None)
+    if forward is None:
         return
-    server, bind_address, server_port = loop.forward_dict.pop(key).result()
+    futur, server_port = forward
+    if loop.free_ports is not None and server_port:
+        loop.free_ports.add(server_port)
+    if not futur.done() or futur.exception():
+        return
+    server, bind_address, server_port = futur.result()
     # Close server
     server.close()
     yield from server.wait_closed()
@@ -250,8 +265,12 @@ def handle_db_client(reader, writer, key):
         with closing(db_writer):
             while not reader.at_eof() and not db_reader.at_eof():
                 # Read request
-                request = yield from forward_giop_frame(
-                    reader, db_writer, bind_address)
+                try:
+                    request = yield from forward_giop_frame(
+                        reader, db_writer, bind_address)
+                except ConnectionRefusedError as error:
+                    logger.error('Unexpected connection refused: %s', error)
+                    return                    
                 if not request:
                     break
                 # Choose patch
@@ -262,8 +281,13 @@ def handle_db_client(reader, writer, key):
                 else:
                     patch = Patch.NONE
                 # Read reply_header
-                reply = yield from forward_giop_frame(
-                    db_reader, writer, bind_address, patch=patch)
+                try:
+                    reply = yield from forward_giop_frame(
+                        db_reader, writer, bind_address, patch=patch)
+                except ConnectionRefusedError as error:
+                    logger.warning('Connection refused: %s', error)
+                    return
+                    
 
 
 @asyncio.coroutine
@@ -275,8 +299,11 @@ def check_ior(raw_body, bind_address, loop):
     ior, start, stop = ior
     host = giop.from_byte_string(ior.host)
     # Start port forwarding
-    server, _, server_port = yield from get_forwarding(
+    forward = yield from get_forwarding(
         host, ior.port, HandlerType.DS, bind_address, loop=loop)
+    if forward is None:
+        return False
+    server, _, server_port = forward
     # Patch IOR
     ior = ior._replace(host=giop.to_byte_string(bind_address),
                        port=server_port)
@@ -349,8 +376,11 @@ def check_zmq(raw_body, bind_address, loop):
     for endpoint in endpoints:
         host, port = giop.decode_zmq_endpoint(endpoint)
         # Start port forwarding
-        _, zmq_bind_address, server_port = yield from get_forwarding(
+        forward = yield from get_forwarding(
             host, port, HandlerType.ZMQ, bind_address, loop=loop)
+        if forward is None:
+            return False
+        _, zmq_bind_address, server_port = forward
         # Make new endpoints
         new_endpoint = giop.encode_zmq_endpoint(zmq_bind_address, server_port)
         new_endpoints.append(new_endpoint)
@@ -370,7 +400,7 @@ def check_zmq(raw_body, bind_address, loop):
 
 # Run server
 
-def run_gateway_server(bind_address, server_port, tango_host, debug=True):
+def run_gateway_server(bind_address, server_port, tango_host, port_range=None, debug=True):
     """Run a Tango gateway server."""
     # Configure logger
     if debug:
@@ -381,6 +411,7 @@ def run_gateway_server(bind_address, server_port, tango_host, debug=True):
     loop.server_port = server_port
     loop.tango_host = tango_host
     loop.forward_dict = {}
+    loop.free_ports = None if port_range is None else set(port_range)
     loop.bound_socket = socket.socket()
     loop.bound_socket.bind((bind_address, 0))
     loop.bound_port = loop.bound_socket.getsockname()[1]
@@ -396,7 +427,7 @@ def run_gateway_server(bind_address, server_port, tango_host, debug=True):
         check_task.cancel()
     # Close all the servers
     servers = [fut.result()[0]
-               for fut in loop.forward_dict.values()
+               for fut, _ in loop.forward_dict.values()
                if fut.done() and not fut.exception()]
     for server in servers:
         server.close()
